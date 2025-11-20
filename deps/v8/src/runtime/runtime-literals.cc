@@ -730,6 +730,13 @@ RUNTIME_FUNCTION(Runtime_SetPrototypeProperties) {
                                             feedback_cell_array, current_slot));
   }
 
+  if (IsSpecialReceiverMap(js_proto->map())) {
+    RETURN_RESULT_OR_FAILURE(
+        isolate, SetPrototypePropertiesSlow(isolate, context, obj,
+                                            object_boilerplate_description,
+                                            feedback_cell_array, current_slot));
+  }
+
   bool is_default_func_prototype =
       IsDefaultFunctionPrototype(js_proto, isolate);
 
@@ -765,6 +772,8 @@ RUNTIME_FUNCTION(Runtime_SetPrototypeProperties) {
                                isolate);
       DirectHandle<Object> value(object_boilerplate_description->value(index),
                                  isolate);
+
+      CHECK(IsName(*key));
       PropertyKey lookup_key(isolate, key);
 
       LookupIterator it(isolate, js_proto, lookup_key,
@@ -782,7 +791,11 @@ RUNTIME_FUNCTION(Runtime_SetPrototypeProperties) {
       value = InstantiateIfSharedFunctionInfo(
           context, isolate, value, feedback_cell_array, current_slot);
       DirectHandle<String> name = Cast<String>(key);
-      JSObject::SetOwnPropertyIgnoreAttributes(js_proto, name, value, NONE)
+      Maybe<PropertyAttributes> maybe = JSReceiver::GetPropertyAttributes(&it);
+      PropertyAttributes attr = maybe.ToChecked();
+      if (attr == ABSENT) attr = NONE;
+
+      JSObject::SetOwnPropertyIgnoreAttributes(js_proto, name, value, attr)
           .Check();
 
       result = value;

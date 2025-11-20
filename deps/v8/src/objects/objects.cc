@@ -560,10 +560,16 @@ MaybeDirectHandle<String> Object::NoSideEffectsToMaybeString(
     Isolate* isolate, DirectHandle<Object> input) {
   DisallowJavascriptExecution no_js(isolate);
 
-  if (IsString(*input) || IsNumber(*input) || IsOddball(*input)) {
+  if (IsAnyHole(*input, isolate)) {
+    ReadOnlyRoots roots(isolate);
+#define HOLE_CASE(CamelName, snake_name, _) \
+  if (Is##CamelName(*input))                \
+    return isolate->factory()->NewStringFromAsciiChecked(#CamelName);
+    HOLE_LIST(HOLE_CASE)
+#undef HOLE_CASE
+    UNREACHABLE();
+  } else if (IsString(*input) || IsNumber(*input) || IsOddball(*input)) {
     return Object::ToString(isolate, input).ToHandleChecked();
-  } else if (IsTerminationException(*input)) {
-    return isolate->factory()->NewStringFromStaticChars("TerminationException");
   } else if (IsJSProxy(*input)) {
     DirectHandle<Object> currInput = input;
     do {
@@ -758,11 +764,11 @@ template <typename IsolateT>
 bool Object::BooleanValue(Tagged<Object> obj, IsolateT* isolate) {
   if (IsSmi(obj)) return Smi::ToInt(obj) != 0;
   DCHECK(IsHeapObject(obj));
+#ifdef V8_ENABLE_WEBASSEMBLY
+  DCHECK(!IsWasmNull(obj));
+#endif
   if (IsBoolean(obj)) return IsTrue(obj, isolate);
   if (IsNullOrUndefined(obj, isolate)) return false;
-#ifdef V8_ENABLE_WEBASSEMBLY
-  if (IsWasmNull(obj)) return false;
-#endif
   if (IsUndetectable(obj)) return false;  // Undetectable object is false.
   if (IsString(obj)) return Cast<String>(obj)->length() != 0;
   if (IsHeapNumber(obj)) return DoubleToBoolean(Cast<HeapNumber>(obj)->value());
@@ -1527,15 +1533,14 @@ MaybeHandle<JSAny> Object::GetPropertyWithAccessor(LookupIterator* it) {
                                  Object::ConvertReceiver(isolate, receiver));
     }
 
-    PropertyCallbackArguments args(isolate, info->data(), *receiver, *holder,
+    PropertyCallbackArguments args(isolate, *info, *receiver, *holder,
                                    Just(kDontThrow));
-    DirectHandle<JSAny> result = args.CallAccessorGetter(info, name);
+    DirectHandle<JSAny> result = args.CallAccessorGetter(name);
     RETURN_EXCEPTION_IF_EXCEPTION(isolate);
     Handle<JSAny> reboxed_result(*result, isolate);
     if (info->replace_on_access() && IsJSReceiver(*receiver)) {
-      RETURN_ON_EXCEPTION(isolate,
-                          Accessors::ReplaceAccessorWithDataProperty(
-                              isolate, receiver, holder, name, result));
+      RETURN_ON_EXCEPTION(isolate, Accessors::ReplaceAccessorWithDataProperty(
+                                       isolate, holder, name, result));
     }
     return reboxed_result;
   }
@@ -1562,9 +1567,9 @@ MaybeHandle<JSAny> Object::GetPropertyWithAccessor(LookupIterator* it) {
   return isolate->factory()->undefined_value();
 }
 
-Maybe<bool> Object::SetPropertyWithAccessor(
-    LookupIterator* it, DirectHandle<Object> value,
-    Maybe<ShouldThrow> maybe_should_throw) {
+Maybe<bool> Object::SetPropertyWithAccessor(LookupIterator* it,
+                                            DirectHandle<Object> value,
+                                            Maybe<ShouldThrow> should_throw) {
   Isolate* isolate = it->isolate();
   DirectHandle<Object> structure = it->GetAccessors();
   DirectHandle<JSAny> receiver = it->GetReceiver();
@@ -1597,14 +1602,17 @@ Maybe<bool> Object::SetPropertyWithAccessor(
                                  Object::ConvertReceiver(isolate, receiver));
     }
 
-    PropertyCallbackArguments args(isolate, info->data(), *receiver, *holder,
-                                   maybe_should_throw);
-    bool result = args.CallAccessorSetter(info, name, value);
+    PropertyCallbackArguments args(isolate, *info, *receiver, *holder,
+                                   should_throw);
+    bool result = args.CallAccessorSetter(name, value);
     RETURN_VALUE_IF_EXCEPTION(isolate, Nothing<bool>());
-    // Ensure the setter callback respects the "should throw" value - it's
-    // allowed to fail without throwing only in case of kDontThrow.
-    DCHECK_IMPLIES(!result,
-                   GetShouldThrow(isolate, maybe_should_throw) == kDontThrow);
+    if (!result) {
+      // Make sure TypeError is thrown if necessary in case the callback
+      // failed to set the property.
+      RETURN_FAILURE(isolate, GetShouldThrow(isolate, should_throw),
+                     NewTypeError(MessageTemplate::kStrictCannotSetProperty,
+                                  it->GetName(), receiver));
+    }
     return Just(result);
   }
 
@@ -1624,10 +1632,10 @@ Maybe<bool> Object::SetPropertyWithAccessor(
   } else if (IsCallable(*setter)) {
     // TODO(rossberg): nicer would be to cast to some JSCallable here...
     return SetPropertyWithDefinedSetter(receiver, Cast<JSReceiver>(setter),
-                                        value, maybe_should_throw);
+                                        value, should_throw);
   }
 
-  RETURN_FAILURE(isolate, GetShouldThrow(isolate, maybe_should_throw),
+  RETURN_FAILURE(isolate, GetShouldThrow(isolate, should_throw),
                  NewTypeError(MessageTemplate::kNoSetterInCallback,
                               it->GetName(), it->GetHolder<JSObject>()));
 }
@@ -2318,8 +2326,15 @@ Maybe<bool> Object::SetPropertyInternal(LookupIterator* it,
             return Nothing<bool>();
           }
           switch (result) {
-            case InterceptorResult::kFalse:
-              return Just(false);
+            case InterceptorResult::kFalse: {
+              // Throw TypeError if necessary in case the callback failed
+              // to set the property.
+              Isolate* isolate = it->isolate();
+              RETURN_FAILURE(
+                  isolate, GetShouldThrow(isolate, should_throw),
+                  NewTypeError(MessageTemplate::kStrictCannotSetProperty,
+                               it->GetName(), it->GetReceiver()));
+            }
             case InterceptorResult::kTrue:
               return Just(true);
             case InterceptorResult::kNotIntercepted:
@@ -2580,7 +2595,6 @@ Maybe<bool> Object::SetSuperProperty(LookupIterator* it,
 Maybe<bool> Object::CannotCreateProperty(Isolate* isolate,
                                          DirectHandle<JSAny> receiver,
                                          DirectHandle<Object> name,
-                                         DirectHandle<Object> value,
                                          Maybe<ShouldThrow> should_throw) {
   RETURN_FAILURE(
       isolate, GetShouldThrow(isolate, should_throw),
@@ -2692,7 +2706,7 @@ Maybe<bool> Object::AddDataProperty(LookupIterator* it,
                                     EnforceDefineSemantics semantics) {
   if (!IsJSReceiver(*it->GetReceiver())) {
     return CannotCreateProperty(it->isolate(), it->GetReceiver(), it->GetName(),
-                                value, should_throw);
+                                should_throw);
   }
 
   // Private symbols should be installed on JSProxy using
@@ -3331,7 +3345,7 @@ Maybe<bool> JSArray::ArraySetLength(Isolate* isolate, DirectHandle<JSArray> a,
   if (!result) {
     RETURN_FAILURE(
         isolate, GetShouldThrow(isolate, should_throw),
-        NewTypeError(MessageTemplate::kStrictDeleteProperty,
+        NewTypeError(MessageTemplate::kStrictCannotDeleteProperty,
                      isolate->factory()->NewNumberFromUint(actual_new_len - 1),
                      a));
   }
@@ -3956,9 +3970,9 @@ void DescriptorArray::CopyFrom(InternalIndex index,
   Set(index, src->GetKey(index), src->GetValue(index), details);
 }
 
-void DescriptorArray::Sort() {
+void DescriptorArray::SortImpl(const int len) {
   // In-place heap sort.
-  const int len = number_of_descriptors();
+  DCHECK_EQ(len, number_of_descriptors());
   // Reset sorting since the descriptor array might contain invalid pointers.
   for (int i = 0; i < len; ++i) SetSortedKey(i, i);
   // Bottom-up max-heap construction.
